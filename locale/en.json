@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Delete Plugin",
+    "description": "Provides session deletion in workspace conversation menus and row action buttons."
+  }
+}
