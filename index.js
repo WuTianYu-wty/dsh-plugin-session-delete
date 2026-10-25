@@ -5,6 +5,26 @@ import { homedir } from 'node:os';
 
 export const inject = ['webServer', 'workspaceRegistry'];
 
+async function deleteSessionDirRecursively(rootDir, sessionId) {
+  if (!existsSync(rootDir)) return;
+  try {
+    const entries = await readdir(rootDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const fullPath = join(rootDir, entry.name);
+        if (entry.name === sessionId) {
+          await rm(fullPath, { recursive: true, force: true });
+        } else {
+          const subTarget = join(fullPath, sessionId);
+          if (existsSync(subTarget)) {
+            await rm(subTarget, { recursive: true, force: true });
+          }
+        }
+      }
+    }
+  } catch (e) {}
+}
+
 export function apply(ctx) {
   ctx.effect(() => {
     // If route already registered, clean it up before re-registering
@@ -51,18 +71,10 @@ export function apply(ctx) {
             return;
           }
 
-          ctx.logger?.info?.(`[session-delete] Deleting ${sessionIds.length} session(s): ${sessionIds.join(', ')}`);
+          ctx.logger?.info?.(`[session-delete] Processing deletion for ${sessionIds.length} session(s): ${sessionIds.join(', ')}`);
 
           const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh');
           const sessionsRoot = join(dshHome, 'sessions');
-          let projectDirs = [];
-          try {
-            if (existsSync(sessionsRoot)) {
-              const entries = await readdir(sessionsRoot, { withFileTypes: true });
-              projectDirs = entries.filter(e => e.isDirectory()).map(e => e.name);
-            }
-          } catch (e) {}
-
           const deletedIds = [];
 
           for (const sessionId of sessionIds) {
@@ -80,11 +92,9 @@ export function apply(ctx) {
               if (agent && typeof agent.cancel === 'function') {
                 agent.cancel({ kind: 'user' });
               }
-            } catch (e) {
-              ctx.logger?.warn?.(`[session-delete] Cancelling agent ${sessionId} failed: ${String(e)}`);
-            }
+            } catch (e) {}
 
-            // 3. Detach from all workspaces
+            // 3. Detach from all workspaces (for grouped sessions)
             try {
               const registry = ctx.workspaceRegistry;
               if (registry && typeof registry.list === 'function') {
@@ -111,9 +121,7 @@ export function apply(ctx) {
                   await registry.unpinSession(sessionId);
                 }
               }
-            } catch (e) {
-              ctx.logger?.warn?.(`[session-delete] Unarchive/unpin failed: ${String(e)}`);
-            }
+            } catch (e) {}
 
             // 5. Clean up in-memory registry caches
             try {
@@ -126,7 +134,7 @@ export function apply(ctx) {
               }
             } catch (e) {}
 
-            // 6. Clean up in-memory sessions store if present
+            // 6. Clean up in-memory sessions store
             try {
               const sessions = ctx.get('sessions');
               if (sessions?.store?.has?.(sessionId)) {
@@ -134,15 +142,10 @@ export function apply(ctx) {
               }
             } catch (e) {}
 
-            // 7. Delete physical session directory on disk
+            // 7. Delete physical session directory on disk (covers all project dirs & _no-cwd)
             try {
-              for (const pDir of projectDirs) {
-                const targetDir = join(sessionsRoot, pDir, sessionId);
-                if (existsSync(targetDir)) {
-                  await rm(targetDir, { recursive: true, force: true });
-                  ctx.logger?.info?.(`[session-delete] Removed session directory: ${targetDir}`);
-                }
-              }
+              await deleteSessionDirRecursively(sessionsRoot, sessionId);
+              ctx.logger?.info?.(`[session-delete] Deleted disk artifacts for session: ${sessionId}`);
             } catch (e) {
               ctx.logger?.warn?.(`[session-delete] Deleting session dir on disk failed: ${String(e)}`);
             }

@@ -29,10 +29,10 @@ window.__ModuleLoader__.load({
 
     // 2. Batch delete modal open state store
     let isBatchModalOpen = false;
-    let batchFilterWorkspace = ''; // default: all
+    let batchFilterWorkspace = 'all';
     const batchListeners = new Set();
 
-    function setBatchModalState(open, filterWs = '') {
+    function setBatchModalState(open, filterWs = 'all') {
       isBatchModalOpen = !!open;
       if (filterWs) batchFilterWorkspace = filterWs;
       for (const listener of batchListeners) {
@@ -54,6 +54,81 @@ window.__ModuleLoader__.load({
         return () => batchListeners.delete(setState);
       }, []);
       return state;
+    }
+
+    // Helper: Prune deleted session IDs from Client's reactive stores
+    function pruneClientSessions(ctx, deletedIds) {
+      if (!deletedIds || deletedIds.length === 0) return;
+      const idSet = new Set(deletedIds);
+
+      // A. Prune from sessions service
+      try {
+        const sessionsService = ctx.get('sessions');
+        if (sessionsService) {
+          for (const id of deletedIds) {
+            try {
+              sessionsService.handleSessionRemoved?.(id);
+            } catch (e) {}
+          }
+          if (sessionsService.list?.getSnapshot && sessionsService.list?.set) {
+            const snapshot = sessionsService.list.getSnapshot();
+            const nextIds = (snapshot.ids || []).filter((id) => !idSet.has(id));
+            const nextById = { ...(snapshot.byId || {}) };
+            for (const id of deletedIds) {
+              delete nextById[id];
+            }
+            sessionsService.list.set({
+              ...snapshot,
+              ids: nextIds,
+              byId: nextById,
+            });
+          }
+          try {
+            sessionsService.refresh?.();
+          } catch (e) {}
+        }
+      } catch (e) {
+        console.warn('[session-delete] Prune sessions store failed:', e);
+      }
+
+      // B. Prune from workspaces service
+      try {
+        const workspacesService = ctx.get('workspaces');
+        if (workspacesService?.list?.getSnapshot && workspacesService?.list?.set) {
+          const wsSnapshot = workspacesService.list.getSnapshot();
+          const nextItems = (wsSnapshot.items || []).map((ws) => ({
+            ...ws,
+            sessionIds: (ws.sessionIds || []).filter((id) => !idSet.has(id)),
+          }));
+          const nextArchived = (wsSnapshot.archivedSessionIds || []).filter((id) => !idSet.has(id));
+          const nextPinned = (wsSnapshot.pinnedSessionIds || []).filter((id) => !idSet.has(id));
+          workspacesService.list.set({
+            ...wsSnapshot,
+            items: nextItems,
+            archivedSessionIds: nextArchived,
+            pinnedSessionIds: nextPinned,
+          });
+        }
+      } catch (e) {
+        console.warn('[session-delete] Prune workspaces store failed:', e);
+      }
+
+      // C. If active session was deleted, start fresh session
+      try {
+        const sessionsService = ctx.get('sessions');
+        const uiWorkspace = ctx.get('uiWorkspace');
+        const listSnapshot = sessionsService?.list?.getSnapshot?.();
+        if (listSnapshot && uiWorkspace) {
+          const mainSession = Object.values(listSnapshot.byId || {}).find(
+            (s) => (s?.retainedBy?.mainView ?? 0) > 0
+          );
+          if (mainSession && idSet.has(mainSession.id)) {
+            uiWorkspace.startSession?.();
+          }
+        }
+      } catch (e) {
+        console.warn('[session-delete] Switch active session failed:', e);
+      }
     }
 
     // Modern Trash Icon SVG component
@@ -118,7 +193,7 @@ window.__ModuleLoader__.load({
       return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
     }
 
-    // Stylesheet text using theme tokens
+    // High quality CSS Stylesheet matching DeepSeek Harness dark theme tokens
     const STYLES = `
       .dsh-del-menu-item {
         box-sizing: border-box;
@@ -145,7 +220,7 @@ window.__ModuleLoader__.load({
         outline: none;
       }
       .dsh-del-menu-item.batch {
-        color: var(--dsw-alias-label-primary, #ddd);
+        color: var(--dsw-alias-label-primary, #e2e8f0);
       }
       .dsh-del-menu-item.batch:hover {
         color: var(--dsw-alias-state-warn-primary, #f59e0b);
@@ -168,7 +243,7 @@ window.__ModuleLoader__.load({
         border: none;
         background: transparent;
         border-radius: var(--dsw-radius-sm, 4px);
-        color: var(--dsw-alias-label-secondary, #999);
+        color: var(--dsw-alias-label-secondary, #94a3b8);
         cursor: pointer;
         transition: background 0.12s ease, color 0.12s ease;
       }
@@ -183,26 +258,26 @@ window.__ModuleLoader__.load({
         align-items: center;
         gap: 6px;
         height: 32px;
-        padding: 0 8px;
+        padding: 0 10px;
         border: none;
         background: transparent;
         border-radius: var(--dsw-radius-sm, 6px);
-        color: var(--dsw-alias-label-secondary, #999);
+        color: var(--dsw-alias-label-secondary, #94a3b8);
         font-size: 13px;
         cursor: pointer;
         transition: background 0.12s ease, color 0.12s ease;
       }
       .dsh-footer-batch-btn:hover {
         background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));
-        color: var(--dsw-alias-state-error-primary, #ef4444);
+        color: var(--dsw-alias-label-primary, #f8fafc);
       }
 
       .dsh-del-modal-overlay {
         position: fixed;
         inset: 0;
         z-index: 10000;
-        background: rgba(0, 0, 0, 0.65);
-        backdrop-filter: blur(2px);
+        background: rgba(0, 0, 0, 0.72);
+        backdrop-filter: blur(6px);
         display: flex;
         align-items: center;
         justify-content: center;
@@ -215,37 +290,37 @@ window.__ModuleLoader__.load({
 
       .dsh-del-modal-card {
         box-sizing: border-box;
-        background: var(--dsw-alias-bg-layer-1, #1e1e20);
-        border: 1px solid var(--dsw-alias-border-l1, #333338);
-        border-radius: var(--dsw-radius-lg, 12px);
-        width: 420px;
+        background: var(--dsw-alias-bg-layer-1, #18181b);
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.1));
+        border-radius: 12px;
+        width: 440px;
         max-width: calc(100vw - 32px);
         padding: 24px;
-        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.5);
-        color: var(--dsw-alias-label-primary, #f0f0f2);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
+        color: var(--dsw-alias-label-primary, #f8fafc);
         font-family: inherit;
         animation: dshDelZoomIn 0.15s ease-out;
       }
 
       .dsh-batch-modal-card {
         box-sizing: border-box;
-        background: var(--dsw-alias-bg-layer-1, #1e1e20);
-        border: 1px solid var(--dsw-alias-border-l1, #333338);
-        border-radius: var(--dsw-radius-lg, 12px);
-        width: 580px;
+        background: var(--dsw-alias-bg-layer-1, #18181b);
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.1));
+        border-radius: 14px;
+        width: 620px;
         max-width: calc(100vw - 32px);
-        max-height: 85vh;
+        max-height: 88vh;
         display: flex;
         flex-direction: column;
         padding: 24px;
-        box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55);
-        color: var(--dsw-alias-label-primary, #f0f0f2);
+        box-shadow: 0 24px 60px rgba(0, 0, 0, 0.65);
+        color: var(--dsw-alias-label-primary, #f8fafc);
         font-family: inherit;
         animation: dshDelZoomIn 0.15s ease-out;
       }
 
       @keyframes dshDelZoomIn {
-        from { transform: scale(0.96); opacity: 0; }
+        from { transform: scale(0.97); opacity: 0; }
         to { transform: scale(1); opacity: 1; }
       }
 
@@ -255,96 +330,132 @@ window.__ModuleLoader__.load({
         gap: 10px;
         font-size: 16px;
         font-weight: 600;
-        color: var(--dsw-alias-label-primary, #fff);
-        margin-bottom: 8px;
+        color: var(--dsw-alias-label-primary, #f8fafc);
+        margin-bottom: 6px;
       }
-      .dsh-del-modal-title svg {
-        color: var(--dsw-alias-state-error-primary, #ef4444);
+      .dsh-del-icon-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 32px;
+        height: 32px;
+        border-radius: 8px;
+        background: rgba(239, 68, 68, 0.15);
+        color: #ef4444;
+        flex-shrink: 0;
       }
 
       .dsh-batch-modal-subtitle {
         font-size: 12px;
-        color: var(--dsw-alias-label-secondary, #999);
+        color: var(--dsw-alias-label-secondary, #94a3b8);
         margin-bottom: 16px;
         line-height: 18px;
       }
 
+      /* Workspace Segmented Tabs */
+      .dsh-batch-tabs {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        background: var(--dsw-alias-bg-base, #0f0f12);
+        padding: 3px;
+        border-radius: 8px;
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.08));
+        margin-bottom: 12px;
+        overflow-x: auto;
+      }
+      .dsh-batch-tab {
+        box-sizing: border-box;
+        border: none;
+        background: transparent;
+        color: var(--dsw-alias-label-secondary, #94a3b8);
+        padding: 5px 12px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 500;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: all 0.15s ease;
+      }
+      .dsh-batch-tab:hover {
+        color: var(--dsw-alias-label-primary, #f8fafc);
+      }
+      .dsh-batch-tab.active {
+        background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.12));
+        color: #ffffff;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+      }
+
+      /* Filter & Search Bar */
       .dsh-batch-filter-bar {
         display: flex;
         align-items: center;
         gap: 8px;
-        margin-bottom: 12px;
-        flex-wrap: wrap;
+        margin-bottom: 10px;
       }
 
       .dsh-batch-search-input {
         box-sizing: border-box;
         flex: 1;
-        min-width: 140px;
-        height: 32px;
-        background: var(--dsw-alias-bg-base, #141416);
-        border: 1px solid var(--dsw-alias-border-l1, #333338);
-        border-radius: 6px;
-        padding: 0 10px;
+        height: 34px;
+        background: var(--dsw-alias-bg-base, #0f0f12);
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.1));
+        border-radius: 8px;
+        padding: 0 12px;
         font-size: 13px;
-        color: var(--dsw-alias-label-primary, #eee);
+        color: var(--dsw-alias-label-primary, #f8fafc);
         outline: none;
-        transition: border-color 0.15s ease;
+        transition: border-color 0.15s ease, box-shadow 0.15s ease;
       }
       .dsh-batch-search-input:focus {
         border-color: var(--dsw-alias-brand-primary, #3b82f6);
+        box-shadow: 0 0 0 1px var(--dsw-alias-brand-primary, #3b82f6);
       }
 
-      .dsh-batch-ws-select {
+      .dsh-batch-action-btn {
         box-sizing: border-box;
-        height: 32px;
-        background: var(--dsw-alias-bg-base, #141416);
-        border: 1px solid var(--dsw-alias-border-l1, #333338);
-        border-radius: 6px;
-        padding: 0 8px;
+        height: 34px;
+        padding: 0 12px;
+        background: var(--dsw-alias-bg-base, #0f0f12);
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.1));
+        border-radius: 8px;
         font-size: 12px;
-        color: var(--dsw-alias-label-primary, #eee);
-        outline: none;
+        font-weight: 500;
+        color: var(--dsw-alias-label-primary, #cbd5e1);
         cursor: pointer;
-      }
-
-      .dsh-batch-select-all-btn {
-        box-sizing: border-box;
-        height: 32px;
-        padding: 0 10px;
-        background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));
-        border: 1px solid var(--dsw-alias-border-l1, #333338);
-        border-radius: 6px;
-        font-size: 12px;
-        color: var(--dsw-alias-label-primary, #eee);
-        cursor: pointer;
-        transition: background 0.12s ease;
+        transition: all 0.12s ease;
         white-space: nowrap;
       }
-      .dsh-batch-select-all-btn:hover {
-        background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.14));
+      .dsh-batch-action-btn:hover:not(:disabled) {
+        background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.08));
+        color: #ffffff;
+      }
+      .dsh-batch-action-btn:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
       }
 
+      /* Session List Container */
       .dsh-batch-list {
         box-sizing: border-box;
         flex: 1;
-        min-height: 180px;
-        max-height: 360px;
+        min-height: 200px;
+        max-height: 380px;
         overflow-y: auto;
-        border: 1px solid var(--dsw-alias-border-l1, #333338);
-        border-radius: 8px;
-        background: var(--dsw-alias-bg-base, #141416);
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.08));
+        border-radius: 10px;
+        background: var(--dsw-alias-bg-base, #0f0f12);
         padding: 4px;
         display: flex;
         flex-direction: column;
-        gap: 2px;
+        gap: 3px;
       }
 
       .dsh-batch-list::-webkit-scrollbar {
         width: 6px;
       }
       .dsh-batch-list::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.15);
+        background: rgba(255, 255, 255, 0.18);
         border-radius: 3px;
       }
 
@@ -352,46 +463,53 @@ window.__ModuleLoader__.load({
         box-sizing: border-box;
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 8px 10px;
-        border-radius: 6px;
+        gap: 12px;
+        padding: 10px 12px;
+        border-radius: 8px;
         cursor: pointer;
         user-select: none;
-        transition: background 0.12s ease;
+        transition: all 0.12s ease;
+        border: 1px solid transparent;
       }
       .dsh-batch-item:hover {
-        background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.06));
+        background: var(--dsw-alias-bg-layer-2, rgba(255, 255, 255, 0.05));
       }
       .dsh-batch-item.selected {
-        background: rgba(239, 68, 68, 0.08);
+        background: rgba(239, 68, 68, 0.09);
+        border-color: rgba(239, 68, 68, 0.25);
       }
 
       .dsh-batch-item input[type="checkbox"] {
         cursor: pointer;
-        width: 15px;
-        height: 15px;
+        width: 16px;
+        height: 16px;
         accent-color: var(--dsw-alias-state-error-primary, #ef4444);
         flex-shrink: 0;
       }
 
       .dsh-batch-item-ws {
         font-size: 11px;
-        padding: 2px 6px;
+        padding: 2px 7px;
         border-radius: 4px;
         background: rgba(255, 255, 255, 0.08);
-        color: var(--dsw-alias-label-secondary, #999);
+        color: var(--dsw-alias-label-secondary, #94a3b8);
         flex-shrink: 0;
+        font-weight: 500;
       }
-      .dsh-batch-item-ws.archived {
+      .dsh-batch-item-ws.ungrouped {
         background: rgba(245, 158, 11, 0.15);
         color: var(--dsw-alias-state-warn-primary, #f59e0b);
+      }
+      .dsh-batch-item-ws.archived {
+        background: rgba(148, 163, 184, 0.15);
+        color: #94a3b8;
       }
 
       .dsh-batch-item-title {
         flex: 1;
         font-size: 13px;
         font-weight: 500;
-        color: var(--dsw-alias-label-primary, #eee);
+        color: var(--dsw-alias-label-primary, #f1f5f9);
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -399,7 +517,7 @@ window.__ModuleLoader__.load({
 
       .dsh-batch-item-time {
         font-size: 11px;
-        color: var(--dsw-alias-label-secondary, #777);
+        color: var(--dsw-alias-label-secondary, #64748b);
         flex-shrink: 0;
       }
 
@@ -408,33 +526,34 @@ window.__ModuleLoader__.load({
         align-items: center;
         justify-content: center;
         flex: 1;
-        color: var(--dsw-alias-label-secondary, #777);
+        color: var(--dsw-alias-label-secondary, #64748b);
         font-size: 13px;
-        padding: 30px;
+        padding: 40px;
       }
 
-      .dsh-del-modal-body {
+      /* Target Card in Single Delete */
+      .dsh-del-single-target-card {
+        box-sizing: border-box;
+        margin: 14px 0;
+        padding: 12px 14px;
+        border-radius: 8px;
+        background: var(--dsw-alias-bg-base, #0f0f12);
+        border: 1px solid var(--dsw-alias-border-l1, rgba(255, 255, 255, 0.08));
         font-size: 13px;
-        line-height: 20px;
-        color: var(--dsw-alias-label-secondary, #a0a0a5);
-      }
-
-      .dsh-del-modal-target {
         font-weight: 500;
-        color: var(--dsw-alias-label-primary, #fff);
-        margin: 6px 0;
+        color: var(--dsw-alias-label-primary, #f8fafc);
         word-break: break-all;
       }
 
       .dsh-del-modal-warning {
         color: var(--dsw-alias-state-error-primary, #ef4444);
         font-size: 12px;
-        margin-top: 8px;
         line-height: 18px;
+        margin-top: 10px;
       }
 
       .dsh-del-modal-error {
-        margin-top: 10px;
+        margin-top: 12px;
         padding: 8px 12px;
         border-radius: 6px;
         background: rgba(239, 68, 68, 0.15);
@@ -454,16 +573,18 @@ window.__ModuleLoader__.load({
       .dsh-del-modal-footer .dsh-batch-summary {
         margin-right: auto;
         font-size: 13px;
-        color: var(--dsw-alias-label-secondary, #aaa);
+        font-weight: 500;
+        color: var(--dsw-alias-label-secondary, #94a3b8);
       }
 
       .dsh-del-btn-cancel {
         box-sizing: border-box;
-        padding: 6px 16px;
-        border-radius: var(--dsw-radius-md, 6px);
-        border: 1px solid var(--dsw-alias-border-l2, #3e3e44);
+        height: 34px;
+        padding: 0 16px;
+        border-radius: 8px;
+        border: 1px solid var(--dsw-alias-border-l2, rgba(255, 255, 255, 0.15));
         background: transparent;
-        color: var(--dsw-alias-label-primary, #eee);
+        color: var(--dsw-alias-label-primary, #f1f5f9);
         font-size: 13px;
         font-weight: 500;
         cursor: pointer;
@@ -475,24 +596,40 @@ window.__ModuleLoader__.load({
 
       .dsh-del-btn-confirm {
         box-sizing: border-box;
-        padding: 6px 16px;
-        border-radius: var(--dsw-radius-md, 6px);
+        height: 34px;
+        padding: 0 18px;
+        border-radius: 8px;
         border: 1px solid var(--dsw-alias-state-error-primary, #ef4444);
         background: var(--dsw-alias-state-error-primary, #ef4444);
         color: #ffffff;
         font-size: 13px;
         font-weight: 500;
         cursor: pointer;
-        transition: opacity 0.12s ease;
+        transition: opacity 0.12s ease, transform 0.1s ease;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
       }
       .dsh-del-btn-confirm:hover:not(:disabled) {
-        opacity: 0.9;
+        opacity: 0.92;
+        transform: translateY(-1px);
+      }
+      .dsh-del-btn-confirm:active:not(:disabled) {
+        transform: translateY(0);
       }
 
       .dsh-del-btn-cancel:disabled,
       .dsh-del-btn-confirm:disabled {
-        opacity: 0.5;
+        opacity: 0.45;
         cursor: not-allowed;
+      }
+
+      .dsh-inline-confirm-badge {
+        font-size: 12px;
+        font-weight: 500;
+        color: #ef4444;
+        margin-right: 6px;
+        animation: dshDelFadeIn 0.15s ease-out;
       }
     `;
 
@@ -569,11 +706,11 @@ window.__ModuleLoader__.load({
               onClick: handleClick,
             },
             React.createElement(CheckListIcon, { size: 14 }),
-            React.createElement('span', null, isChinese() ? '批量删除...' : 'Batch Delete...')
+            React.createElement('span', null, isChinese() ? '批量管理与删除...' : 'Batch Manage & Delete...')
           );
         }
 
-        // 3. Session row hover action button (quick single delete)
+        // 3. Session row hover quick delete button
         function DeleteRowAction(props) {
           const { sessionId, displayTitle } = props;
 
@@ -601,15 +738,15 @@ window.__ModuleLoader__.load({
         // 4. Sidebar footer action button
         function SidebarFooterBatchButton(props) {
           const { wide } = props;
-          const label = isChinese() ? '批量删除' : 'Batch Delete';
+          const label = isChinese() ? '批量管理' : 'Batch Manage';
 
           return React.createElement(
             'button',
             {
               type: 'button',
               className: 'dsh-footer-batch-btn',
-              title: isChinese() ? '批量删除会话' : 'Batch Delete Sessions',
-              'aria-label': isChinese() ? '批量删除会话' : 'Batch Delete Sessions',
+              title: isChinese() ? '批量管理与删除会话' : 'Batch Manage Conversations',
+              'aria-label': isChinese() ? '批量管理与删除会话' : 'Batch Manage Conversations',
               onClick: () => {
                 setBatchModalState(true);
               },
@@ -648,33 +785,20 @@ window.__ModuleLoader__.load({
             if (deleting) return;
             setDeleting(true);
             setError(null);
+            const sessionId = target.sessionId;
             try {
               const res = await fetch('/api/delete-session', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sessionId: target.sessionId }),
+                body: JSON.stringify({ sessionId }),
               });
               const data = await res.json();
               if (!res.ok || data.error) {
                 throw new Error(data.error || (isChinese() ? '删除失败' : 'Deletion failed'));
               }
 
-              // Check if deleted session was the currently active one
-              try {
-                const sessions = ctx.get('sessions');
-                const uiWorkspace = ctx.get('uiWorkspace');
-                const listSnapshot = sessions?.list?.getSnapshot?.();
-                if (listSnapshot && uiWorkspace) {
-                  const mainSession = Object.values(listSnapshot.byId || {}).find(
-                    (s) => (s?.retainedBy?.mainView ?? 0) > 0
-                  );
-                  if (mainSession && mainSession.id === target.sessionId) {
-                    uiWorkspace.startSession?.();
-                  }
-                }
-              } catch (e) {
-                console.warn('[session-delete] Failed to switch active session:', e);
-              }
+              // Prune from in-memory stores and switch active session if needed
+              pruneClientSessions(ctx, [sessionId]);
 
               setDeleting(false);
               setSingleTarget(null);
@@ -704,33 +828,33 @@ window.__ModuleLoader__.load({
               React.createElement(
                 'div',
                 { className: 'dsh-del-modal-title' },
-                React.createElement(TrashIcon, { size: 18 }),
-                React.createElement('span', null, isChinese() ? '删除会话' : 'Delete Session')
+                React.createElement(
+                  'span',
+                  { className: 'dsh-del-icon-badge' },
+                  React.createElement(TrashIcon, { size: 16 })
+                ),
+                React.createElement('span', null, isChinese() ? '彻底删除对话' : 'Delete Conversation')
               ),
               React.createElement(
                 'div',
-                { className: 'dsh-del-modal-body' },
-                React.createElement(
-                  'p',
-                  { style: { margin: '0 0 8px 0' } },
-                  isChinese()
-                    ? '确定要彻底删除以下会话吗？'
-                    : 'Are you sure you want to permanently delete this session?'
-                ),
-                React.createElement(
-                  'div',
-                  { className: 'dsh-del-modal-target' },
-                  `“${titleText}”`
-                ),
-                React.createElement(
-                  'div',
-                  { className: 'dsh-del-modal-warning' },
-                  isChinese()
-                    ? '⚠️ 此操作将永久删除该会话的所有聊天历史和记录，无法恢复。'
-                    : '⚠️ This will permanently delete all chat history for this session. This action cannot be undone.'
-                ),
-                error && React.createElement('div', { className: 'dsh-del-modal-error' }, error)
+                { style: { fontSize: '13px', color: '#94a3b8', margin: '4px 0 0 0' } },
+                isChinese()
+                  ? '确定要彻底删除该会话记录吗？'
+                  : 'Are you sure you want to permanently delete this conversation?'
               ),
+              React.createElement(
+                'div',
+                { className: 'dsh-del-single-target-card' },
+                `“${titleText}”`
+              ),
+              React.createElement(
+                'div',
+                { className: 'dsh-del-modal-warning' },
+                isChinese()
+                  ? '⚠️ 此操作将永久抹除该对话的所有聊天记录及磁盘文件，无法恢复。'
+                  : '⚠️ This will permanently remove all messages and disk files for this session.'
+              ),
+              error && React.createElement('div', { className: 'dsh-del-modal-error' }, error),
               React.createElement(
                 'div',
                 { className: 'dsh-del-modal-footer' },
@@ -754,7 +878,7 @@ window.__ModuleLoader__.load({
                   },
                   deleting
                     ? (isChinese() ? '正在删除…' : 'Deleting…')
-                    : (isChinese() ? '彻底删除' : 'Delete Permanently')
+                    : (isChinese() ? '彻底删除' : 'Delete')
                 )
               )
             )
@@ -766,8 +890,9 @@ window.__ModuleLoader__.load({
           const modalState = useBatchModalState();
           const [selectedSet, setSelectedSet] = React.useState(new Set());
           const [searchQuery, setSearchQuery] = React.useState('');
-          const [filterWorkspace, setFilterWorkspace] = React.useState('all');
+          const [activeTab, setActiveTab] = React.useState('all');
           const [deleting, setDeleting] = React.useState(false);
+          const [confirming, setConfirming] = React.useState(false);
           const [error, setError] = React.useState(null);
 
           const sessionsService = ctx.get('sessions');
@@ -800,6 +925,7 @@ window.__ModuleLoader__.load({
               setSearchQuery('');
               setError(null);
               setDeleting(false);
+              setConfirming(false);
             }
           }, [modalState.open]);
 
@@ -807,24 +933,26 @@ window.__ModuleLoader__.load({
             if (!modalState.open) return;
             const handleKeyDown = (e) => {
               if (e.key === 'Escape' && !deleting) {
-                setBatchModalState(false);
+                if (confirming) setConfirming(false);
+                else setBatchModalState(false);
               }
             };
             window.addEventListener('keydown', handleKeyDown);
             return () => window.removeEventListener('keydown', handleKeyDown);
-          }, [modalState.open, deleting]);
+          }, [modalState.open, deleting, confirming]);
 
           if (!modalState.open) return null;
 
           const workspaces = workspacesSnapshot.items || [];
           const archivedSet = new Set(workspacesSnapshot.archivedSessionIds || []);
 
-          // Build session items list
+          // Build all session items
           const allSessionItems = (sessionsSnapshot.ids || []).map((id) => {
             const summary = sessionsSnapshot.byId?.[id];
             const title = summary?.displayTitle || summary?.title || (isChinese() ? '无标题会话' : 'Untitled');
             const updatedAt = summary?.updatedAt || 0;
             const ws = workspaces.find((w) => w.sessionIds && w.sessionIds.includes(id));
+            const isUngrouped = !ws;
             const wsName = ws ? (ws.title || ws.path) : (isChinese() ? '未分组' : 'Ungrouped');
             const wsId = ws ? ws.workspaceId : 'ungrouped';
             const isArchived = archivedSet.has(id);
@@ -834,14 +962,25 @@ window.__ModuleLoader__.load({
               updatedAt,
               workspaceName: wsName,
               workspaceId: wsId,
+              isUngrouped,
               isArchived,
             };
           });
 
-          // Filter by workspace & search query
+          // Counts for tabs
+          const tabCounts = {
+            all: allSessionItems.length,
+            ungrouped: allSessionItems.filter((i) => i.isUngrouped).length,
+          };
+          for (const ws of workspaces) {
+            tabCounts[ws.workspaceId] = allSessionItems.filter((i) => i.workspaceId === ws.workspaceId).length;
+          }
+
+          // Filter by active tab & search query
           const filteredItems = allSessionItems.filter((item) => {
-            if (filterWorkspace !== 'all' && item.workspaceId !== filterWorkspace) {
-              return false;
+            if (activeTab !== 'all') {
+              if (activeTab === 'ungrouped' && !item.isUngrouped) return false;
+              if (activeTab !== 'ungrouped' && item.workspaceId !== activeTab) return false;
             }
             if (searchQuery.trim()) {
               const q = searchQuery.trim().toLowerCase();
@@ -852,6 +991,7 @@ window.__ModuleLoader__.load({
 
           const handleToggle = (id) => {
             if (deleting) return;
+            setConfirming(false);
             setSelectedSet((prev) => {
               const next = new Set(prev);
               if (next.has(id)) next.delete(id);
@@ -862,6 +1002,7 @@ window.__ModuleLoader__.load({
 
           const handleSelectAll = () => {
             if (deleting) return;
+            setConfirming(false);
             const allFilteredSelected = filteredItems.length > 0 && filteredItems.every((it) => selectedSet.has(it.id));
             if (allFilteredSelected) {
               // Deselect all filtered
@@ -880,19 +1021,20 @@ window.__ModuleLoader__.load({
             }
           };
 
-          const handleBatchConfirm = async () => {
+          // Two-phase inline confirmation execution (no browser window.confirm!)
+          const handleBatchDeleteClick = async () => {
             if (deleting || selectedSet.size === 0) return;
-            const count = selectedSet.size;
-            const sessionIds = Array.from(selectedSet);
 
-            const promptText = isChinese()
-              ? `确定要彻底删除选中的 ${count} 个会话吗？此操作将永久抹除所有聊天历史，无法恢复！`
-              : `Are you sure you want to permanently delete the ${count} selected sessions? This cannot be undone!`;
+            // Phase 1: show inline confirmation if not yet confirming
+            if (!confirming) {
+              setConfirming(true);
+              return;
+            }
 
-            if (!window.confirm(promptText)) return;
-
+            // Phase 2: actually execute deletion
             setDeleting(true);
             setError(null);
+            const sessionIds = Array.from(selectedSet);
 
             try {
               const res = await fetch('/api/delete-session', {
@@ -905,23 +1047,11 @@ window.__ModuleLoader__.load({
                 throw new Error(data.error || (isChinese() ? '批量删除失败' : 'Batch delete failed'));
               }
 
-              // Check if current active session was among the deleted ones
-              try {
-                const listSnapshot = sessionsService?.list?.getSnapshot?.();
-                const uiWorkspace = ctx.get('uiWorkspace');
-                if (listSnapshot && uiWorkspace) {
-                  const mainSession = Object.values(listSnapshot.byId || {}).find(
-                    (s) => (s?.retainedBy?.mainView ?? 0) > 0
-                  );
-                  if (mainSession && selectedSet.has(mainSession.id)) {
-                    uiWorkspace.startSession?.();
-                  }
-                }
-              } catch (e) {
-                console.warn('[session-delete] switch active session error:', e);
-              }
+              // Prune from in-memory stores and switch active session if needed
+              pruneClientSessions(ctx, sessionIds);
 
               setDeleting(false);
+              setConfirming(false);
               setBatchModalState(false);
             } catch (err) {
               setDeleting(false);
@@ -946,57 +1076,135 @@ window.__ModuleLoader__.load({
                 role: 'dialog',
                 'aria-modal': 'true',
               },
+              // Header
               React.createElement(
                 'div',
-                { className: 'dsh-del-modal-title' },
-                React.createElement(TrashIcon, { size: 18 }),
-                React.createElement('span', null, isChinese() ? '批量删除会话' : 'Batch Delete Conversations')
+                { style: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: '8px' } },
+                React.createElement(
+                  'div',
+                  null,
+                  React.createElement(
+                    'div',
+                    { className: 'dsh-del-modal-title' },
+                    React.createElement(
+                      'span',
+                      { className: 'dsh-del-icon-badge' },
+                      React.createElement(TrashIcon, { size: 16 })
+                    ),
+                    React.createElement('span', null, isChinese() ? '批量管理与删除对话' : 'Batch Manage & Delete')
+                  ),
+                  React.createElement(
+                    'div',
+                    { className: 'dsh-batch-modal-subtitle' },
+                    isChinese()
+                      ? '勾选需要清理的会话记录。选中的记录将被物理彻底删除，无法恢复。'
+                      : 'Select conversations to permanently delete from workspaces and disk.'
+                  )
+                ),
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    style: {
+                      background: 'transparent',
+                      border: 'none',
+                      color: '#94a3b8',
+                      cursor: 'pointer',
+                      fontSize: '18px',
+                      padding: '4px',
+                      borderRadius: '6px',
+                    },
+                    disabled: deleting,
+                    onClick: () => setBatchModalState(false),
+                  },
+                  '✕'
+                )
               ),
+              // Workspace Tabs Segmented Control
               React.createElement(
                 'div',
-                { className: 'dsh-batch-modal-subtitle' },
-                isChinese()
-                  ? '勾选需要删除的会话记录。选中的记录将被彻底从工作区与磁盘中抹除，无法恢复。'
-                  : 'Select the conversation records you want to delete. Selected items will be permanently erased.'
+                { className: 'dsh-batch-tabs' },
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    className: `dsh-batch-tab ${activeTab === 'all' ? 'active' : ''}`,
+                    onClick: () => {
+                      setActiveTab('all');
+                      setConfirming(false);
+                    },
+                  },
+                  `${isChinese() ? '全部' : 'All'} (${tabCounts.all})`
+                ),
+                workspaces.map((ws) =>
+                  React.createElement(
+                    'button',
+                    {
+                      key: ws.workspaceId,
+                      type: 'button',
+                      className: `dsh-batch-tab ${activeTab === ws.workspaceId ? 'active' : ''}`,
+                      onClick: () => {
+                        setActiveTab(ws.workspaceId);
+                        setConfirming(false);
+                      },
+                    },
+                    `${ws.title || ws.path} (${tabCounts[ws.workspaceId] || 0})`
+                  )
+                ),
+                React.createElement(
+                  'button',
+                  {
+                    type: 'button',
+                    className: `dsh-batch-tab ${activeTab === 'ungrouped' ? 'active' : ''}`,
+                    onClick: () => {
+                      setActiveTab('ungrouped');
+                      setConfirming(false);
+                    },
+                  },
+                  `${isChinese() ? '未分组' : 'Ungrouped'} (${tabCounts.ungrouped})`
+                )
               ),
-              // Filter bar
+              // Search & Select Controls
               React.createElement(
                 'div',
                 { className: 'dsh-batch-filter-bar' },
-                React.createElement(
-                  'select',
-                  {
-                    className: 'dsh-batch-ws-select',
-                    value: filterWorkspace,
-                    disabled: deleting,
-                    onChange: (e) => setFilterWorkspace(e.target.value),
-                  },
-                  React.createElement('option', { value: 'all' }, isChinese() ? '全部工作区' : 'All Workspaces'),
-                  workspaces.map((ws) =>
-                    React.createElement('option', { key: ws.workspaceId, value: ws.workspaceId }, ws.title || ws.path)
-                  ),
-                  React.createElement('option', { value: 'ungrouped' }, isChinese() ? '未分组' : 'Ungrouped')
-                ),
                 React.createElement('input', {
                   type: 'text',
                   className: 'dsh-batch-search-input',
-                  placeholder: isChinese() ? '搜索会话标题...' : 'Search conversation title...',
+                  placeholder: isChinese() ? '按标题或工作区搜索...' : 'Search by title or workspace...',
                   value: searchQuery,
                   disabled: deleting,
-                  onChange: (e) => setSearchQuery(e.target.value),
+                  onChange: (e) => {
+                    setSearchQuery(e.target.value);
+                    setConfirming(false);
+                  },
                 }),
                 React.createElement(
                   'button',
                   {
                     type: 'button',
-                    className: 'dsh-batch-select-all-btn',
+                    className: 'dsh-batch-action-btn',
                     disabled: deleting || filteredItems.length === 0,
                     onClick: handleSelectAll,
                   },
-                  allFilteredSelected ? (isChinese() ? '取消全选' : 'Deselect All') : (isChinese() ? '全选' : 'Select All')
-                )
+                  allFilteredSelected ? (isChinese() ? '取消全选' : 'Deselect All') : (isChinese() ? '全选当前' : 'Select All')
+                ),
+                selectedSet.size > 0 &&
+                  React.createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-batch-action-btn',
+                      disabled: deleting,
+                      onClick: () => {
+                        setSelectedSet(new Set());
+                        setConfirming(false);
+                      },
+                    },
+                    isChinese() ? '清空' : 'Clear'
+                  )
               ),
-              // Session items list
+              // Scrollable Session List
               React.createElement(
                 'div',
                 { className: 'dsh-batch-list' },
@@ -1024,7 +1232,11 @@ window.__ModuleLoader__.load({
                         }),
                         React.createElement(
                           'span',
-                          { className: `dsh-batch-item-ws ${item.isArchived ? 'archived' : ''}` },
+                          {
+                            className: `dsh-batch-item-ws ${item.isUngrouped ? 'ungrouped' : ''} ${
+                              item.isArchived ? 'archived' : ''
+                            }`,
+                          },
                           item.isArchived ? `${item.workspaceName} (已归档)` : item.workspaceName
                         ),
                         React.createElement('span', { className: 'dsh-batch-item-title' }, item.title),
@@ -1033,7 +1245,7 @@ window.__ModuleLoader__.load({
                     })
               ),
               error && React.createElement('div', { className: 'dsh-del-modal-error' }, error),
-              // Footer
+              // Footer Toolbar
               React.createElement(
                 'div',
                 { className: 'dsh-del-modal-footer' },
@@ -1041,29 +1253,49 @@ window.__ModuleLoader__.load({
                   'div',
                   { className: 'dsh-batch-summary' },
                   isChinese()
-                    ? `已选 ${selectedSet.size} / 共 ${allSessionItems.length} 个会话`
+                    ? `已选择 ${selectedSet.size} / 共 ${allSessionItems.length} 个对话`
                     : `Selected ${selectedSet.size} of ${allSessionItems.length} sessions`
                 ),
-                React.createElement(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'dsh-del-btn-cancel',
-                    disabled: deleting,
-                    onClick: () => setBatchModalState(false),
-                  },
-                  isChinese() ? '取消' : 'Cancel'
-                ),
+                confirming &&
+                  React.createElement(
+                    'span',
+                    { className: 'dsh-inline-confirm-badge' },
+                    isChinese() ? `⚠️ 确定删除选中的 ${selectedSet.size} 个对话？` : `⚠️ Confirm deletion?`
+                  ),
+                confirming &&
+                  React.createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-del-btn-cancel',
+                      disabled: deleting,
+                      onClick: () => setConfirming(false),
+                    },
+                    isChinese() ? '返回' : 'Back'
+                  ),
+                !confirming &&
+                  React.createElement(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'dsh-del-btn-cancel',
+                      disabled: deleting,
+                      onClick: () => setBatchModalState(false),
+                    },
+                    isChinese() ? '取消' : 'Cancel'
+                  ),
                 React.createElement(
                   'button',
                   {
                     type: 'button',
                     className: 'dsh-del-btn-confirm',
                     disabled: deleting || selectedSet.size === 0,
-                    onClick: handleBatchConfirm,
+                    onClick: handleBatchDeleteClick,
                   },
                   deleting
-                    ? (isChinese() ? '正在删除…' : 'Deleting…')
+                    ? (isChinese() ? '正在彻底删除…' : 'Deleting…')
+                    : confirming
+                    ? (isChinese() ? `确认彻底删除 (${selectedSet.size})` : `Confirm Delete (${selectedSet.size})`)
                     : isChinese()
                     ? `彻底删除选中项 (${selectedSet.size})`
                     : `Delete Selected (${selectedSet.size})`
